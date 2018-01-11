@@ -244,7 +244,7 @@ type EngineOptions struct {
 // DefaultEngineOptions are the default engine options.
 var DefaultEngineOptions = &EngineOptions{
 	MaxConcurrentQueries: 20,
-	Timeout:              2 * time.Minute,
+	Timeout:              2 * time.Hour,
 	Logger:               log.NewNopLogger(),
 }
 
