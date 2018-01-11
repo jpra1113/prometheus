@@ -141,10 +141,10 @@ func Open(path string, l log.Logger, r prometheus.Registerer, opts *Options) (*t
 	}
 
 	db, err := tsdb.Open(path, l, r, &tsdb.Options{
-		WALFlushInterval:  10 * time.Second,
-		RetentionDuration: uint64(time.Duration(opts.Retention).Seconds() * 1000),
+		WALFlushInterval:  0,
+		RetentionDuration: 0,
 		BlockRanges:       rngs,
-		NoLockfile:        opts.NoLockfile,
+		NoLockfile:        true,
 	})
 	if err != nil {
 		return nil, err
