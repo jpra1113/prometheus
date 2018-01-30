@@ -15,6 +15,8 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -27,10 +29,12 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/gobwas/glob"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/spf13/viper"
 
 	influx "github.com/influxdata/influxdb/client/v2"
 
@@ -42,18 +46,27 @@ import (
 )
 
 type config struct {
-	graphiteAddress         string
-	graphiteTransport       string
-	graphitePrefix          string
-	opentsdbURL             string
-	influxdbURL             string
-	influxdbRetentionPolicy string
-	influxdbUsername        string
-	influxdbDatabase        string
-	influxdbPassword        string
-	remoteTimeout           time.Duration
-	listenAddr              string
-	telemetryPath           string
+	graphiteAddress          string
+	graphiteTransport        string
+	graphitePrefix           string
+	opentsdbURL              string
+	influxdbURL              string
+	influxdbRetentionPolicy  string
+	influxdbUsername         string
+	influxdbDatabase         string
+	influxdbPassword         string
+	remoteTimeout            time.Duration
+	listenAddr               string
+	telemetryPath            string
+	storageAdapterConfigPath string
+}
+
+type metricInfo struct {
+	Version_ int `json:"version":"version"`
+}
+
+type MetricsConfig struct {
+	Metrics map[string]metricInfo `json:"metrics"`
 }
 
 var (
@@ -104,7 +117,32 @@ func main() {
 	logger := promlog.New(logLevel)
 
 	writers, readers := buildClients(logger, cfg)
-	serve(logger, cfg.listenAddr, writers, readers)
+
+	adapterCfg, err := readConfig(cfg.storageAdapterConfigPath)
+	if err != nil {
+		level.Error(logger).Log("msg", "Unable to read configure file", "err", err.Error())
+	}
+
+	filterMetricPatterns := []glob.Glob{}
+	if filterMetricsConfigUrl := adapterCfg.GetString("filterMetricsConfigUrl"); filterMetricsConfigUrl != "" {
+		metricsConfig, err := downloadConfigFile(filterMetricsConfigUrl)
+		if err != nil {
+			level.Error(logger).Log("msg", "Read error", "err", err.Error())
+		}
+		for metricName, _ := range metricsConfig.Metrics {
+			pattern, err := glob.Compile(metricName)
+			if err != nil {
+				level.Error(logger).Log(
+					"msg", "Unable to compile filter metric namespace",
+					"name", metricName,
+					"err", err.Error(),
+				)
+			}
+			filterMetricPatterns = append(filterMetricPatterns, pattern)
+		}
+	}
+
+	serve(logger, cfg.listenAddr, writers, readers, filterMetricPatterns)
 }
 
 func parseFlags() *config {
@@ -141,10 +179,53 @@ func parseFlags() *config {
 	)
 	flag.StringVar(&cfg.listenAddr, "web.listen-address", ":9201", "Address to listen on for web endpoints.")
 	flag.StringVar(&cfg.telemetryPath, "web.telemetry-path", "/metrics", "Address to listen on for web endpoints.")
+	flag.StringVar(&cfg.storageAdapterConfigPath, "storageAdapterConfigPath", "/etc/storage_adapter/adapter_config.json",
+		"The path of the storage adapter config.",
+	)
 
 	flag.Parse()
 
 	return cfg
+}
+
+func readConfig(fileConfig string) (*viper.Viper, error) {
+	viper := viper.New()
+	viper.SetConfigType("json")
+
+	if fileConfig == "" {
+		viper.SetConfigName("adapter_config")
+		viper.AddConfigPath("/etc/storage_adapter")
+	} else {
+		viper.SetConfigFile(fileConfig)
+	}
+
+	// overwrite by file
+	err := viper.ReadInConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	return viper, nil
+}
+
+func setDefault() {
+	//TODO: set default value
+}
+
+func downloadConfigFile(url string) (*MetricsConfig, error) {
+	response, err := http.Get(url)
+	if err != nil {
+		return nil, errors.New("Unable to download config file: " + err.Error())
+	}
+	defer response.Body.Close()
+
+	decoder := json.NewDecoder(response.Body)
+	configs := MetricsConfig{}
+	if err := decoder.Decode(&configs); err != nil {
+		return nil, errors.New("Unable to decode body: " + err.Error())
+	}
+
+	return &configs, nil
 }
 
 type writer interface {
@@ -201,7 +282,7 @@ func buildClients(logger log.Logger, cfg *config) ([]writer, []reader) {
 	return writers, readers
 }
 
-func serve(logger log.Logger, addr string, writers []writer, readers []reader) error {
+func serve(logger log.Logger, addr string, writers []writer, readers []reader, filterMetricPatterns []glob.Glob) error {
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -224,7 +305,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			return
 		}
 
-		samples := protoToSamples(&req)
+		samples := protoToSamples(&req, filterMetricPatterns)
 		receivedSamples.Add(float64(len(samples)))
 
 		var wg sync.WaitGroup
@@ -294,7 +375,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 	return http.ListenAndServe(addr, nil)
 }
 
-func protoToSamples(req *prompb.WriteRequest) model.Samples {
+func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) model.Samples {
 	var samples model.Samples
 	for _, ts := range req.Timeseries {
 		metric := make(model.Metric, len(ts.Labels))
@@ -303,11 +384,16 @@ func protoToSamples(req *prompb.WriteRequest) model.Samples {
 		}
 
 		for _, s := range ts.Samples {
-			samples = append(samples, &model.Sample{
-				Metric:    metric,
-				Value:     model.SampleValue(s.Value),
-				Timestamp: model.Time(s.Timestamp),
-			})
+			for _, pattern := range filterMetricPatterns {
+				if pattern.Match(metric.String()) {
+					samples = append(samples, &model.Sample{
+						Metric:    metric,
+						Value:     model.SampleValue(s.Value),
+						Timestamp: model.Time(s.Timestamp),
+					})
+					break
+				}
+			}
 		}
 	}
 	return samples
