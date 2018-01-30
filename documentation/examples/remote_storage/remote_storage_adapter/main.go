@@ -384,15 +384,24 @@ func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) 
 		}
 
 		for _, s := range ts.Samples {
+			isAppendMetric := false
+			if len(filterMetricPatterns) == 0 {
+				isAppendMetric = true
+			}
+
 			for _, pattern := range filterMetricPatterns {
 				if pattern.Match(metric.String()) {
-					samples = append(samples, &model.Sample{
-						Metric:    metric,
-						Value:     model.SampleValue(s.Value),
-						Timestamp: model.Time(s.Timestamp),
-					})
+					isAppendMetric = true
 					break
 				}
+			}
+
+			if isAppendMetric {
+				samples = append(samples, &model.Sample{
+					Metric:    metric,
+					Value:     model.SampleValue(s.Value),
+					Timestamp: model.Time(s.Timestamp),
+				})
 			}
 		}
 	}
