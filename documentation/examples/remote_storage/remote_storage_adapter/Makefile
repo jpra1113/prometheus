@@ -1,5 +1,5 @@
 ORGANIZATION=hyperpilot
-IMAGE=remote_storage_adapter
+IMAGE=prometheus_adapter
 TAG=latest
 
 .PHONY: build docker-build docker-push
